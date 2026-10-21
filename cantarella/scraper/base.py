@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import html as html_lib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -412,33 +413,98 @@ def run_n_m3u8dl(url: str, save_name: str, task_dir, *, kind: str = "sub",
     else:
         cmd += ["--auto-select"]
 
-    try:
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0,
-        )
-    except (FileNotFoundError, PermissionError, OSError) as exc:
-        print(f"could not launch N_m3u8DL-RE: {exc}", flush=True)
-        return False
+    # N_m3u8DL-RE 0.5.x draws its progress bars with Spectre.Console. When its
+    # stdout is a plain pipe (Docker / Render / Heroku have no terminal) that
+    # renderer crashes ("Offset and length were out of bounds..." -> exit -6)
+    # the moment the progress display starts, so every download "fails" and the
+    # bot never gets past "Preparing download...". Giving the process a
+    # pseudo-terminal (Linux/macOS) makes it behave exactly like it does in a
+    # real shell; Windows has no pty and keeps the old pipe.
+    master_fd = None
+    proc = None
+    if os.name == "posix":
+        try:
+            import fcntl
+            import pty
+            import struct
+            import termios
+
+            master_fd, slave_fd = pty.openpty()
+            try:
+                fcntl.ioctl(slave_fd, termios.TIOCSWINSZ,
+                            struct.pack("HHHH", 50, 200, 0, 0))
+            except Exception:
+                pass
+            env = dict(os.environ)
+            env.setdefault("TERM", "xterm-256color")
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                    close_fds=True, env=env,
+                )
+            finally:
+                os.close(slave_fd)
+        except Exception as exc:
+            print(f"pty unavailable ({exc}); falling back to a pipe", flush=True)
+            if master_fd is not None:
+                try:
+                    os.close(master_fd)
+                except Exception:
+                    pass
+            master_fd = None
+            proc = None
+
+    if proc is None:
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0,
+            )
+        except (FileNotFoundError, PermissionError, OSError) as exc:
+            print(f"could not launch N_m3u8DL-RE: {exc}", flush=True)
+            return False
+
+    def read_chunks():
+        """Yield raw output bytes from the pty (or the pipe)."""
+        if master_fd is not None:
+            while True:
+                try:
+                    data = os.read(master_fd, 4096)
+                except OSError:  # EIO: the child closed its side of the pty
+                    break
+                if not data:
+                    break
+                yield data
+        else:
+            while True:
+                data = proc.stdout.read(1)
+                if not data:
+                    break
+                yield data
 
     buf = b""
     tail: list[str] = []
-    while True:
-        char = proc.stdout.read(1)
-        if not char:
-            break
-        if char in (b"\r", b"\n"):
-            line = _ANSI_RE.sub("", buf.decode("utf-8", errors="replace")).strip()
-            buf = b""
-            if not line:
-                continue
-            print(f"[{kind.upper()}] {line}", flush=True)
-            tail.append(line)
-            del tail[:-5]
-            parsed = _parse_progress_line(line)
-            if parsed:
-                reporter.progress(kind=kind, title=title, **parsed)
-        else:
-            buf += char
+    try:
+        for chunk in read_chunks():
+            for char in chunk:
+                if char in (13, 10):  # \r or \n
+                    line = _ANSI_RE.sub("", buf.decode("utf-8", errors="replace")).strip()
+                    buf = b""
+                    if not line:
+                        continue
+                    print(f"[{kind.upper()}] {line}", flush=True)
+                    tail.append(line)
+                    del tail[:-5]
+                    parsed = _parse_progress_line(line)
+                    if parsed:
+                        reporter.progress(kind=kind, title=title, **parsed)
+                else:
+                    buf += bytes((char,))
+    finally:
+        if master_fd is not None:
+            try:
+                os.close(master_fd)
+            except Exception:
+                pass
 
     proc.wait()
     if proc.returncode != 0:
